@@ -28,6 +28,7 @@ def derive_settlement(verdict: str) -> str:
     """
     Pure function mapping consensus verdict to settlement outcome.
     Zero tolerance, discrete closed enum, invariant across allegation kinds.
+    UNDETERMINED or unparseable outputs strictly refund both parties (never default to a winner).
     """
     if verdict == "CONFIRMED":
         return "CHALLENGER_WINS"
@@ -90,7 +91,8 @@ def validate_excerpts_and_caps(
 def parse_llm_verdict(raw: str | dict) -> dict:
     """
     Strict schema-aware parser for LLM consensus response.
-    Extracts top-level 'verdict' only. Ignores nested homonyms.
+    Extracts top-level 'verdict' only via exact json.loads.
+    Invalid, malformed, or nested-only outputs return UNDETERMINED (never a paying default).
     """
     if isinstance(raw, dict):
         data = raw
@@ -106,26 +108,18 @@ def parse_llm_verdict(raw: str | dict) -> dict:
         try:
             data = json.loads(text)
         except Exception:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                try:
-                    data = json.loads(text[start : end + 1])
-                except Exception:
-                    return {"verdict": "REJECTED", "reason": "Failed to parse JSON response"}
-            else:
-                return {"verdict": "REJECTED", "reason": "No JSON object found in output"}
+            return {"verdict": "UNDETERMINED", "reason": "Failed to parse JSON response"}
 
     if not isinstance(data, dict):
-        return {"verdict": "REJECTED", "reason": "JSON root is not an object"}
+        return {"verdict": "UNDETERMINED", "reason": "JSON root is not an object"}
 
     verdict_raw = data.get("verdict")
     if not isinstance(verdict_raw, str):
-        return {"verdict": "REJECTED", "reason": "Missing or non-string top-level verdict"}
+        return {"verdict": "UNDETERMINED", "reason": "Missing or non-string top-level verdict"}
 
     verdict = verdict_raw.strip().upper()
     if verdict not in ("CONFIRMED", "REJECTED"):
-        return {"verdict": "REJECTED", "reason": f"Invalid verdict value: {verdict}"}
+        return {"verdict": "UNDETERMINED", "reason": f"Invalid verdict value: {verdict}"}
 
     reason = str(data.get("reason", ""))
     return {"verdict": verdict, "reason": reason}
@@ -269,7 +263,7 @@ class CoverLock(gl.Contract):
         brief_excerpt: str,
     ) -> None:
         """
-        Challenges an open claim by staking counter-funds and citing a specific gap with verified excerpts.
+        Challenges an open claim by staking matching counter-funds and citing a specific gap with verified excerpts.
         """
         if claim_id not in self.claims:
             raise UserError(f"Claim '{claim_id}' not found")
@@ -283,8 +277,8 @@ class CoverLock(gl.Contract):
             raise UserError("Challenge window has expired")
 
         counter_stake = gl.message.value
-        if counter_stake <= u256(0):
-            raise UserError("Counter-stake must be greater than 0")
+        if counter_stake < c.stake:
+            raise UserError(f"Counter-stake ({int(counter_stake)} wei) must be at least equal to claimant stake ({int(c.stake)} wei)")
 
         if gl.message.sender_address == c.claimant:
             raise UserError("Claimant cannot challenge their own claim")
@@ -335,6 +329,7 @@ class CoverLock(gl.Contract):
         """
         Resolves a challenged claim via GenVM comparative consensus on verdict.
         Derives payout via pure function derive_settlement(verdict).
+        Undetermined or unparseable consensus outcomes strictly refund both parties.
         """
         if claim_id not in self.claims:
             raise UserError(f"Claim '{claim_id}' not found")
@@ -380,16 +375,21 @@ class CoverLock(gl.Contract):
             my_data = run_judge()
             my_verdict = my_data.get("verdict")
 
-            # Comparative equivalence compares ONLY verdict
+            # Comparative equivalence compares ONLY valid legal verdicts
             return leader_verdict == my_verdict
 
         consensus_output = gl.vm.run_nondet(run_judge, validator_comparator)
 
         if isinstance(consensus_output, dict):
-            verdict = consensus_output.get("verdict", "REJECTED")
-            reason = str(consensus_output.get("reason", ""))
+            raw_verdict = consensus_output.get("verdict")
+            if raw_verdict in ("CONFIRMED", "REJECTED"):
+                verdict = raw_verdict
+                reason = str(consensus_output.get("reason", ""))
+            else:
+                verdict = "UNDETERMINED"
+                reason = str(consensus_output.get("reason", "Undetermined verdict"))
         else:
-            verdict = "REJECTED"
+            verdict = "UNDETERMINED"
             reason = "Consensus undetermined"
 
         now_ts = self._get_current_timestamp()
@@ -407,7 +407,7 @@ class CoverLock(gl.Contract):
             total_pool = u256(int(c.stake) + int(c.counter_stake))
             gl.get_contract_at(c.claimant).emit_transfer(value=total_pool)
         else:
-            # Refund both parties
+            # Undetermined / failure: Refund both parties' stakes
             gl.get_contract_at(c.claimant).emit_transfer(value=c.stake)
             gl.get_contract_at(c.challenger).emit_transfer(value=c.counter_stake)
 

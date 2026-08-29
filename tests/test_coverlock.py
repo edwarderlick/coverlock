@@ -367,19 +367,23 @@ def test_concord_scar_single_source_of_truth(
     assert contract.recompute_settlement(claim_id) == claim_record["settlement"] == "SUBMITTER_WINS"
 
 
-def test_versionlock_scar_json_parsing_and_no_regex(direct_vm, direct_deploy):
+def test_versionlock_scar_json_parsing_and_no_regex(
+    direct_vm, direct_deploy, direct_alice, direct_bob
+):
     """
     VersionLock Review Scar Fix:
     LLM output is parsed with schema-aware json.loads only.
-    Top-level verdict key is accepted; nested homonyms (e.g. meta.verdict) are ignored.
-    Malformed JSON defaults safely to REJECTED.
-    No regex over JSON is used.
+    Top-level verdict key is accepted only if strictly CONFIRMED or REJECTED.
+    Nested homonyms, garbage, and unparseable outputs return UNDETERMINED.
+    UNDETERMINED never pays the submitter; it strictly refunds both stakes.
     """
     contract = direct_deploy(CONTRACT_PATH, 86400)
     cov_mod = sys.modules["_contract_coverlock"]
     parse_llm_verdict = cov_mod.parse_llm_verdict
+    derive_settlement = cov_mod.derive_settlement
 
     # 1. Nested homonym attack: nested CONFIRMED with top-level REJECTED
+    # Parser extracts top-level REJECTED
     payload_nested_attack = json.dumps(
         {
             "meta": {"verdict": "CONFIRMED", "status": "CONFIRMED"},
@@ -388,9 +392,9 @@ def test_versionlock_scar_json_parsing_and_no_regex(direct_vm, direct_deploy):
         }
     )
     res1 = parse_llm_verdict(payload_nested_attack)
-    assert res1["verdict"] == "REJECTED", "Nested homonym must not override top-level verdict"
+    assert res1["verdict"] == "REJECTED", "Top-level verdict must be respected"
 
-    # 2. Missing top-level verdict (nested only)
+    # 2. Missing top-level verdict (nested only) -> UNDETERMINED (NOT REJECTED!)
     payload_missing_top = json.dumps(
         {
             "data": {"verdict": "CONFIRMED"},
@@ -398,7 +402,8 @@ def test_versionlock_scar_json_parsing_and_no_regex(direct_vm, direct_deploy):
         }
     )
     res2 = parse_llm_verdict(payload_missing_top)
-    assert res2["verdict"] == "REJECTED"
+    assert res2["verdict"] == "UNDETERMINED", "Nested-only verdict must return UNDETERMINED"
+    assert derive_settlement(res2["verdict"]) == "REFUND", "UNDETERMINED must map to REFUND"
 
     # 3. Valid top-level CONFIRMED with markdown codeblock wrapper
     payload_markdown = (
@@ -408,10 +413,45 @@ def test_versionlock_scar_json_parsing_and_no_regex(direct_vm, direct_deploy):
     )
     res3 = parse_llm_verdict(payload_markdown)
     assert res3["verdict"] == "CONFIRMED"
+    assert derive_settlement(res3["verdict"]) == "CHALLENGER_WINS"
 
-    # 4. Total garbage string / malformed JSON
+    # 4. Total garbage string / malformed JSON -> UNDETERMINED (NOT REJECTED!)
     res4 = parse_llm_verdict("Invalid unstructured non-json response text")
-    assert res4["verdict"] == "REJECTED"
+    assert res4["verdict"] == "UNDETERMINED", "Malformed JSON must return UNDETERMINED"
+    assert derive_settlement(res4["verdict"]) == "REFUND", "Malformed JSON parser default must NOT pay submitter"
+
+    # 5. Contract execution on UNDETERMINED returns REFUND
+    claimant = direct_alice
+    challenger = direct_bob
+    direct_vm.deal(claimant, 10**18)
+    direct_vm.deal(challenger, 10**18)
+
+    source = "Source text containing verified audit reports and code coverage metrics."
+    brief = "Brief text summarizing verified audit reports and code coverage metrics."
+
+    with direct_vm.prank(claimant):
+        direct_vm.value = 10**18
+        claim_id = contract.open_claim(source, brief)
+
+    with direct_vm.prank(challenger):
+        direct_vm.value = 10**18
+        contract.challenge_claim(
+            claim_id,
+            "OMISSION",
+            "Alleged gap",
+            "verified audit reports and code coverage metrics.",
+            "",
+        )
+
+    # Mock unparseable LLM output
+    direct_vm.mock_llm(".*", "Non-JSON unparseable garbage output")
+    contract.resolve_claim(claim_id)
+
+    rec = contract.get_claim(claim_id)
+    assert rec["verdict"] == "UNDETERMINED"
+    assert rec["settlement"] == "REFUND"
+    assert rec["paid_to"] == "REFUNDED"
+    assert contract.recompute_settlement(claim_id) == "REFUND"
 
 
 def test_proofreader_scar_excerpt_validation_pre_llm(
@@ -483,6 +523,7 @@ def test_ironclad_scar_caps_and_bounded_history(
     Ironclad Review Scar Fix:
     Explicit size caps on write inputs (source <= 8000, brief <= 4000, fact <= 500).
     Max 1 challenge per claim (reverts on 2nd challenge).
+    Under-staking counter-stake reverts.
     Bounded storage history.
     """
     contract = direct_deploy(CONTRACT_PATH, 86400)
@@ -515,7 +556,19 @@ def test_ironclad_scar_caps_and_bounded_history(
         direct_vm.value = 10**18
         claim_id = contract.open_claim(source, brief)
 
-    # 4. First challenge succeeds
+    # 4. Under-stake challenge reverts
+    with direct_vm.prank(challenger1):
+        direct_vm.value = 10**17  # Less than 10**18
+        with direct_vm.expect_revert("Counter-stake (100000000000000000 wei) must be at least equal to claimant stake"):
+            contract.challenge_claim(
+                claim_id,
+                "OMISSION",
+                "Under-staked challenge",
+                "distributed protocol architecture.",
+                "",
+            )
+
+    # 5. First full-stake challenge succeeds
     with direct_vm.prank(challenger1):
         direct_vm.value = 10**18
         contract.challenge_claim(
@@ -526,7 +579,7 @@ def test_ironclad_scar_caps_and_bounded_history(
             "",
         )
 
-    # 5. Second challenge on already-challenged claim reverts
+    # 6. Second challenge on already-challenged claim reverts
     with direct_vm.prank(challenger2):
         direct_vm.value = 10**18
         with direct_vm.expect_revert("Claim is not OPEN"):
