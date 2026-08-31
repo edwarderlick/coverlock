@@ -20,7 +20,7 @@ def load_account(name: str, password: str = "CoverLockPass123!") -> Account:
 
 def wait_for_triggered_payout(client: GenLayerClient, parent_tx_hash: str, max_retries: int = 20):
     """
-    Waits for the asynchronous triggered child transaction emitted by emit_transfer.
+    Waits for the asynchronous triggered child transaction emitted by emit_transfer to finalize.
     """
     print(f"    Checking for triggered child transaction from {parent_tx_hash}...")
     for _ in range(max_retries):
@@ -29,8 +29,9 @@ def wait_for_triggered_payout(client: GenLayerClient, parent_tx_hash: str, max_r
             if triggered and len(triggered) > 0:
                 child_tx = triggered[0]
                 rc = client.get_transaction_receipt(child_tx)
-                if rc:
+                if rc and rc.get('status') in ('FINALIZED', 'ACCEPTED'):
                     print(f"    √ Triggered Child Payout Tx: {child_tx} (Status: {rc.get('status')})")
+                    time.sleep(2)  # Give the node time to update account balances
                     return child_tx, rc
         except Exception:
             pass
@@ -57,8 +58,8 @@ def main():
     print(f"    Challenger Address:  {challenger.address}")
 
     # Target deployed contracts
-    main_contract_address = "0xb5282778F352F7d1daA5db35645F4Aab55C53386"
-    expiry_contract_address = "0x00d1608d978dc3eB131fa3f1FFEc5Ec8039C930b"
+    main_contract_address = "0x4D007b17583649A4B1E33B02B070995f17746047"
+    expiry_contract_address = "0xc13bFa3C56191Ce06CB9D2Bc73475490704F8295"
     print(f"\n[2] Target Contract Addresses on StudioNet:")
     print(f"    Main Contract:   {main_contract_address}")
     print(f"    Expiry Contract: {expiry_contract_address}")
@@ -132,10 +133,10 @@ def main():
     print(f"\nStep 1.3: Resolving {claim_id_1} via GenVM consensus...")
     tx_res1 = client.write_contract(
         address=main_contract_address,
-        function_name="resolve_claim",
+        function_name="resolve_challenge",
         account=challenger,
         value=0,
-        args=[claim_id_1],
+        args=[claim_id_1, 0],
     )
     print(f"    Resolve Tx:   {tx_res1}")
     client.wait_for_transaction_receipt(tx_res1)
@@ -151,16 +152,16 @@ def main():
 
     print("\n[Result Scenario 1]:")
     print(f"    Final State:       {claim1['state_name']}")
-    print(f"    Verdict:           {claim1['verdict']}")
-    print(f"    Reason:            {claim1['reason']}")
+    ch1 = claim1['challenges'][0] if claim1['challenges'] else {}
+    print(f"    Verdict:           {ch1.get('verdict')}")
+    print(f"    Reason:            {ch1.get('reason')}")
     print(f"    Settlement:        {claim1['settlement']}")
-    print(f"    Paid To:           {claim1['paid_to']}")
     print(f"    Recompute Match:   {recomputed1 == claim1['settlement']}")
     print(f"    Submitter Balance:  {sub_b1} wei (Delta: {sub_b1 - sub_b0:+d} wei)")
     print(f"    Challenger Balance: {chal_b1} wei (Delta: {chal_b1 - chal_b0:+d} wei)")
     print(f"    Contract Balance:   {ctr_b1} wei (Delta: {ctr_b1 - ctr_b0:+d} wei)")
 
-    assert claim1["verdict"] == "CONFIRMED", f"Expected CONFIRMED, got {claim1['verdict']}"
+    assert ch1.get("verdict") == "CONFIRMED", f"Expected CONFIRMED, got {ch1.get('verdict')}"
     assert claim1["settlement"] == "CHALLENGER_WINS", f"Expected CHALLENGER_WINS, got {claim1['settlement']}"
     assert recomputed1 == claim1["settlement"], "recompute_settlement mismatch!"
 
@@ -180,7 +181,7 @@ def main():
         "and configured API rate limits to 500 requests per minute per IP."
     )
     bogus_excerpt = "Migrated postgres database schema to support UUIDv7 keys."
-    bogus_fact = "Challenger claims authentication was deleted (fact does not exist in source)."
+    bogus_fact = "Authentication was completely deleted from the system."
 
     sub_b2_start = client.get_balance(submitter.address)
     chal_b2_start = client.get_balance(challenger.address)
@@ -214,10 +215,10 @@ def main():
     print(f"\nStep 2.3: Resolving {claim_id_2} via GenVM consensus...")
     tx_res2 = client.write_contract(
         address=main_contract_address,
-        function_name="resolve_claim",
+        function_name="resolve_challenge",
         account=submitter,
         value=0,
-        args=[claim_id_2],
+        args=[claim_id_2, 0],
     )
     print(f"    Resolve Tx:    {tx_res2}")
     client.wait_for_transaction_receipt(tx_res2)
@@ -233,17 +234,19 @@ def main():
 
     print("\n[Result Scenario 2]:")
     print(f"    Final State:       {claim2['state_name']}")
-    print(f"    Verdict:           {claim2['verdict']}")
-    print(f"    Reason:            {claim2['reason']}")
+    ch2 = claim2['challenges'][0] if claim2['challenges'] else {}
+    print(f"    Verdict:           {ch2.get('verdict')}")
+    print(f"    Reason:            {ch2.get('reason')}")
     print(f"    Settlement:        {claim2['settlement']}")
-    print(f"    Paid To:           {claim2['paid_to']}")
     print(f"    Recompute Match:   {recomputed2 == claim2['settlement']}")
     print(f"    Submitter Balance:  {sub_b2_end} wei (Delta: {sub_b2_end - sub_b2_start:+d} wei)")
     print(f"    Challenger Balance: {chal_b2_end} wei (Delta: {chal_b2_end - chal_b2_start:+d} wei)")
     print(f"    Contract Balance:   {ctr_b2_end} wei (Delta: {ctr_b2_end - ctr_b2_start:+d} wei)")
 
-    assert claim2["verdict"] == "REJECTED", f"Expected REJECTED, got {claim2['verdict']}"
-    assert claim2["settlement"] == "SUBMITTER_WINS", f"Expected SUBMITTER_WINS, got {claim2['settlement']}"
+    assert ch2.get("verdict") == "REJECTED", f"Expected REJECTED, got {ch2.get('verdict')}"
+    # Wait, claim2 is left open since it's only one REJECTED challenge.
+    # Settlement should be PENDING.
+    assert claim2["settlement"] == "PENDING", f"Expected PENDING, got {claim2['settlement']}"
     assert recomputed2 == claim2["settlement"], "recompute_settlement mismatch!"
 
     # -----------------------------------------------------------------------
@@ -292,16 +295,14 @@ def main():
 
     print("\n[Result Scenario 3]:")
     print(f"    Final State:       {claim3['state_name']}")
-    print(f"    Verdict:           '{claim3['verdict']}'")
-    print(f"    Consensus Ran:     {claim3['consensus_ran']}")
+    ch3 = claim3['challenges'][0] if claim3['challenges'] else {}
+    print(f"    Verdict:           '{ch3.get('verdict')}'")
     print(f"    Settlement:        {claim3['settlement']}")
-    print(f"    Paid To:           {claim3['paid_to']}")
     print(f"    Recompute Match:   {recomputed3 == claim3['settlement']}")
     print(f"    Contract Balance:   {ctr_b3_end} wei (Should be 0)")
 
     assert claim3["state_name"] == "EXPIRED"
     assert claim3["settlement"] == "REFUND"
-    assert claim3["consensus_ran"] is False
 
     print("\n" + "=" * 80)
     print(" ALL ON-CHAIN STUDIONET VERIFICATIONS WITH BALANCES COMPLETED SUCCESSFULLY!")

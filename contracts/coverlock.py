@@ -5,14 +5,14 @@ from genlayer.py.storage import allow_storage, TreeMap, inmem_allocate
 from genlayer.gl.vm import UserError
 import json
 import datetime
+import hashlib
 
 # State Constants
 STATE_OPEN: int = 0
-STATE_CHALLENGED: int = 1
+STATE_BROKEN: int = 1
 STATE_EXPIRED: int = 2
-STATE_SETTLED: int = 3
 
-STATE_NAMES: list[str] = ["OPEN", "CHALLENGED", "EXPIRED", "SETTLED"]
+STATE_NAMES: list[str] = ["OPEN", "BROKEN", "EXPIRED"]
 
 # String Limits
 MAX_SOURCE_LEN: int = 8000
@@ -171,6 +171,20 @@ Return ONLY a valid JSON object with exactly two top-level keys:
 
 
 @allow_storage
+class ChallengeRecord:
+    challenger: Address
+    counter_stake: u256
+    kind: str
+    fact: str
+    source_excerpt: str
+    brief_excerpt: str
+    challenged_at: u256
+    verdict: str
+    reason: str
+    resolved_at: u256
+
+
+@allow_storage
 class ClaimRecord:
     claimant: Address
     source: str
@@ -179,18 +193,11 @@ class ClaimRecord:
     created_at: u256
     deadline: u256
     state: u256
-
-    challenger: Address
-    counter_stake: u256
-    kind: str
-    fact: str
-    source_excerpt: str
-    brief_excerpt: str
-    challenged_at: u256
-
-    verdict: str
-    reason: str
-    resolved_at: u256
+    
+    coverage_paid: bool
+    challenge_count: u256
+    challenges: TreeMap[u256, ChallengeRecord]
+    fingerprints: TreeMap[str, bool]
 
 
 class CoverLock(gl.Contract):
@@ -203,7 +210,6 @@ class CoverLock(gl.Contract):
             raise UserError("challenge_window_seconds must be positive")
         self.challenge_window = u256(challenge_window_seconds)
         self.claim_counter = u256(0)
-        self.claims = TreeMap[str, ClaimRecord]()
 
     def _get_current_timestamp(self) -> int:
         return int(datetime.datetime.now(datetime.timezone.utc).timestamp())
@@ -237,18 +243,9 @@ class CoverLock(gl.Contract):
         rec.created_at = u256(now_ts)
         rec.deadline = u256(deadline_ts)
         rec.state = u256(STATE_OPEN)
-
-        rec.challenger = Address("0x0000000000000000000000000000000000000000")
-        rec.counter_stake = u256(0)
-        rec.kind = ""
-        rec.fact = ""
-        rec.source_excerpt = ""
-        rec.brief_excerpt = ""
-        rec.challenged_at = u256(0)
-
-        rec.verdict = ""
-        rec.reason = ""
-        rec.resolved_at = u256(0)
+        
+        rec.coverage_paid = False
+        rec.challenge_count = u256(0)
 
         self.claims[claim_id] = rec
         return claim_id
@@ -264,6 +261,7 @@ class CoverLock(gl.Contract):
     ) -> None:
         """
         Challenges an open claim by staking matching counter-funds and citing a specific gap with verified excerpts.
+        Supports up to 8 independent challenges per claim while the window is open.
         """
         if claim_id not in self.claims:
             raise UserError(f"Claim '{claim_id}' not found")
@@ -276,12 +274,21 @@ class CoverLock(gl.Contract):
         if now_ts > int(c.deadline):
             raise UserError("Challenge window has expired")
 
+        if int(c.challenge_count) >= 8:
+            raise UserError("Maximum 8 challenges per claim reached")
+
         counter_stake = gl.message.value
         if counter_stake < c.stake:
             raise UserError(f"Counter-stake ({int(counter_stake)} wei) must be at least equal to claimant stake ({int(c.stake)} wei)")
 
         if gl.message.sender_address == c.claimant:
             raise UserError("Claimant cannot challenge their own claim")
+
+        # Replay protection: fingerprint = sha256(kind + \0 + source_excerpt + \0 + brief_excerpt)
+        fingerprint_input = f"{kind}\0{source_excerpt}\0{brief_excerpt}".encode('utf-8')
+        fingerprint = hashlib.sha256(fingerprint_input).hexdigest()
+        if fingerprint in c.fingerprints:
+            raise UserError("Challenge with exactly these citations already exists")
 
         # Deterministic excerpt substring and bounds validation (reverts in Python pre-LLM)
         validate_excerpts_and_caps(
@@ -293,20 +300,27 @@ class CoverLock(gl.Contract):
             brief_excerpt,
         )
 
-        c.state = u256(STATE_CHALLENGED)
-        c.challenger = gl.message.sender_address
-        c.counter_stake = counter_stake
-        c.kind = kind
-        c.fact = fact
-        c.source_excerpt = source_excerpt
-        c.brief_excerpt = brief_excerpt
-        c.challenged_at = u256(now_ts)
+        c.fingerprints[fingerprint] = True
+
+        ch = inmem_allocate(ChallengeRecord)
+        ch.challenger = gl.message.sender_address
+        ch.counter_stake = counter_stake
+        ch.kind = kind
+        ch.fact = fact
+        ch.source_excerpt = source_excerpt
+        ch.brief_excerpt = brief_excerpt
+        ch.challenged_at = u256(now_ts)
+        ch.verdict = ""
+        ch.reason = ""
+        ch.resolved_at = u256(0)
+
+        c.challenges[c.challenge_count] = ch
+        c.challenge_count = u256(int(c.challenge_count) + 1)
 
     @gl.public.write
     def expire_claim(self, claim_id: str) -> None:
         """
-        Expires an unchallenged claim after deadline, refunding claimant.
-        Consensus is never invoked.
+        Expires a claim after the deadline if there are no pending challenges, refunding the submitter's pool.
         """
         if claim_id not in self.claims:
             raise UserError(f"Claim '{claim_id}' not found")
@@ -319,33 +333,47 @@ class CoverLock(gl.Contract):
         if now_ts <= int(c.deadline):
             raise UserError(f"Challenge window has not expired yet (deadline: {int(c.deadline)}, now: {now_ts})")
 
+        if c.coverage_paid:
+            raise UserError("Coverage pool already paid out")
+
+        for i in range(int(c.challenge_count)):
+            if not c.challenges[u256(i)].verdict:
+                raise UserError("Cannot expire claim while there are pending challenges")
+
         c.state = u256(STATE_EXPIRED)
 
         # Refund claimant stake
         gl.get_contract_at(c.claimant).emit_transfer(value=c.stake)
 
     @gl.public.write
-    def resolve_claim(self, claim_id: str) -> None:
+    def resolve_challenge(self, claim_id: str, challenge_id: int) -> None:
         """
-        Resolves a challenged claim via GenVM comparative consensus on verdict.
-        Derives payout via pure function derive_settlement(verdict).
-        Undetermined or unparseable consensus outcomes strictly refund both parties.
+        Resolves a single pending challenge via GenVM comparative consensus on verdict.
+        If REJECTED, forfeits C.
+        If CONFIRMED and first to hit, transfers S+C to challenger and breaks claim.
+        If CONFIRMED but claim already broken, refunds C to challenger.
         """
         if claim_id not in self.claims:
             raise UserError(f"Claim '{claim_id}' not found")
 
         c = self.claims[claim_id]
-        if int(c.state) != STATE_CHALLENGED:
-            raise UserError(f"Claim is not in CHALLENGED state (current state: {STATE_NAMES[int(c.state)]})")
+        ch_id = u256(challenge_id)
+        
+        if ch_id not in c.challenges:
+            raise UserError(f"Challenge {challenge_id} not found")
+            
+        ch = c.challenges[ch_id]
+        if ch.verdict:
+            raise UserError("Challenge is already resolved")
 
         # Defensive excerpt check
         validate_excerpts_and_caps(
             c.source,
             c.brief,
-            c.kind,
-            c.fact,
-            c.source_excerpt,
-            c.brief_excerpt,
+            ch.kind,
+            ch.fact,
+            ch.source_excerpt,
+            ch.brief_excerpt,
         )
 
         # GenVM Comparative Consensus
@@ -353,10 +381,10 @@ class CoverLock(gl.Contract):
             prompt = build_judge_prompt(
                 c.source,
                 c.brief,
-                c.kind,
-                c.fact,
-                c.source_excerpt,
-                c.brief_excerpt,
+                ch.kind,
+                ch.fact,
+                ch.source_excerpt,
+                ch.brief_excerpt,
             )
             raw = gl.nondet.exec_prompt(prompt, response_format="text")
             return parse_llm_verdict(raw)
@@ -368,7 +396,7 @@ class CoverLock(gl.Contract):
             if not isinstance(leader_data, dict):
                 return False
             leader_verdict = leader_data.get("verdict")
-            if leader_verdict not in ("CONFIRMED", "REJECTED"):
+            if leader_verdict not in ("CONFIRMED", "REJECTED", "UNDETERMINED"):
                 return False
 
             # Validator independently re-runs the judge
@@ -393,52 +421,70 @@ class CoverLock(gl.Contract):
             reason = "Consensus undetermined"
 
         now_ts = self._get_current_timestamp()
-        c.verdict = verdict
-        c.reason = reason
-        c.resolved_at = u256(now_ts)
-        c.state = u256(STATE_SETTLED)
+        ch.verdict = verdict
+        ch.reason = reason
+        ch.resolved_at = u256(now_ts)
 
-        # Payout derived strictly by pure function from stored verdict
-        settlement = derive_settlement(verdict)
-        if settlement == "CHALLENGER_WINS":
-            total_pool = u256(int(c.stake) + int(c.counter_stake))
-            gl.get_contract_at(c.challenger).emit_transfer(value=total_pool)
-        elif settlement == "SUBMITTER_WINS":
-            total_pool = u256(int(c.stake) + int(c.counter_stake))
-            gl.get_contract_at(c.claimant).emit_transfer(value=total_pool)
+        # Multi-Challenge Accounting
+        if verdict == "CONFIRMED":
+            if not c.coverage_paid:
+                c.coverage_paid = True
+                c.state = u256(STATE_BROKEN)
+                total_pool = u256(int(c.stake) + int(ch.counter_stake))
+                gl.get_contract_at(ch.challenger).emit_transfer(value=total_pool)
+            else:
+                # Double-payout protection: refund their C, claim is already broken
+                gl.get_contract_at(ch.challenger).emit_transfer(value=ch.counter_stake)
+        elif verdict == "REJECTED":
+            # Forfeit C to claimant. Claim stays OPEN.
+            gl.get_contract_at(c.claimant).emit_transfer(value=ch.counter_stake)
         else:
-            # Undetermined / failure: Refund both parties' stakes
-            gl.get_contract_at(c.claimant).emit_transfer(value=c.stake)
-            gl.get_contract_at(c.challenger).emit_transfer(value=c.counter_stake)
+            # UNDETERMINED: refund C. Claim stays OPEN.
+            gl.get_contract_at(ch.challenger).emit_transfer(value=ch.counter_stake)
 
     @gl.public.view
     def get_claim(self, claim_id: str) -> dict:
         """
         Returns the complete structured public record for a claim.
+        The state is dynamically derived to prevent drift (single source of truth).
         """
         if claim_id not in self.claims:
             raise UserError(f"Claim '{claim_id}' not found")
 
         c = self.claims[claim_id]
-        state_int = int(c.state)
-
-        if state_int == STATE_EXPIRED:
+        
+        # Concord fix: derive claim state dynamically
+        if c.coverage_paid:
+            derived_state = STATE_BROKEN
+            settlement = "CHALLENGER_WINS"
+        elif int(c.state) == STATE_EXPIRED:
+            derived_state = STATE_EXPIRED
             settlement = "REFUND"
-            paid_to = "REFUNDED_TO_CLAIMANT"
-            consensus_ran = False
-        elif state_int == STATE_SETTLED:
-            settlement = derive_settlement(c.verdict)
-            if settlement == "CHALLENGER_WINS":
-                paid_to = c.challenger.as_hex
-            elif settlement == "SUBMITTER_WINS":
-                paid_to = c.claimant.as_hex
-            else:
-                paid_to = "REFUNDED"
-            consensus_ran = True
         else:
+            derived_state = STATE_OPEN
             settlement = "PENDING"
-            paid_to = ""
-            consensus_ran = False
+            
+        challenges_list = []
+        for i in range(int(c.challenge_count)):
+            ch = c.challenges[u256(i)]
+            ch_settlement = "PENDING"
+            if ch.verdict:
+                ch_settlement = derive_settlement(ch.verdict)
+            
+            challenges_list.append({
+                "challenge_id": i,
+                "challenger": ch.challenger.as_hex,
+                "counter_stake": int(ch.counter_stake),
+                "kind": ch.kind,
+                "fact": ch.fact,
+                "source_excerpt": ch.source_excerpt,
+                "brief_excerpt": ch.brief_excerpt,
+                "challenged_at": int(ch.challenged_at),
+                "verdict": ch.verdict,
+                "reason": ch.reason,
+                "resolved_at": int(ch.resolved_at),
+                "settlement": ch_settlement
+            })
 
         return {
             "claim_id": claim_id,
@@ -448,38 +494,26 @@ class CoverLock(gl.Contract):
             "brief": c.brief,
             "created_at": int(c.created_at),
             "deadline": int(c.deadline),
-            "state": state_int,
-            "state_name": STATE_NAMES[state_int],
-            "challenger": c.challenger.as_hex if state_int != STATE_OPEN else "",
-            "counter_stake": int(c.counter_stake),
-            "kind": c.kind,
-            "fact": c.fact,
-            "source_excerpt": c.source_excerpt,
-            "brief_excerpt": c.brief_excerpt,
-            "challenged_at": int(c.challenged_at),
-            "verdict": c.verdict,
-            "reason": c.reason,
-            "resolved_at": int(c.resolved_at),
-            "settlement": settlement,
-            "paid_to": paid_to,
-            "consensus_ran": consensus_ran,
+            "state": derived_state,
+            "state_name": STATE_NAMES[derived_state],
+            "coverage_paid": c.coverage_paid,
+            "challenge_count": int(c.challenge_count),
+            "challenges": challenges_list,
+            "settlement": settlement
         }
 
     @gl.public.view
     def recompute_settlement(self, claim_id: str) -> str:
         """
-        Pure function over stored verdict (single source of truth).
-        Strictly equals get_claim(claim_id)['settlement'].
+        Pure function to compute settlement state.
         """
         if claim_id not in self.claims:
             raise UserError(f"Claim '{claim_id}' not found")
 
         c = self.claims[claim_id]
-        state_int = int(c.state)
-
-        if state_int == STATE_EXPIRED:
+        if c.coverage_paid:
+            return "CHALLENGER_WINS"
+        elif int(c.state) == STATE_EXPIRED:
             return "REFUND"
-        elif state_int == STATE_SETTLED:
-            return derive_settlement(c.verdict)
         else:
             return "PENDING"
