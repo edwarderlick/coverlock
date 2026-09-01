@@ -52,7 +52,7 @@ stateDiagram-v2
 
 ### States
 - **`OPEN` (0)**: Submitter staked GEN backing the complete and faithful coverage of the source by the brief. The challenge window is active. Challenges can be filed.
-- **`BROKEN` (1)**: A challenger successfully proved a gap (`OMISSION`, `CONTRADICTION`, `FABRICATION`). The coverage pool was paid to the successful challenger. No further challenges can be filed or resolved.
+- **`BROKEN` (1)**: A challenger successfully proved a gap (`OMISSION`, `CONTRADICTION`, `FABRICATION`). The coverage pool was paid to the successful challenger. No further challenges can be filed, but pending ones can resolve as `C_REFUNDED`.
 - **`EXPIRED` (2)**: The challenge window closed without any confirmed challenge. Submitter reclaimed 100% of their stake.
 
 ---
@@ -122,7 +122,7 @@ CoverLock incorporates specific architectural defenses derived from past smart c
   - Unfenced raw text is parsed strictly using `json.loads` only. No regex, no bracket slicing.
   - Only top-level `"verdict"` strictly matching `"CONFIRMED"` or `"REJECTED"` is accepted.
   - Any parse error, nested-only verdict, or missing top-level key returns `{"verdict": "UNDETERMINED"}`.
-  - `derive_settlement("UNDETERMINED")` maps strictly to `"REFUND"`. **A parser failure never pays a winner; it refunds both stakes.**
+  - An `UNDETERMINED` verdict safely refunds that challenge's counter-stake and leaves the claim open. **A parser failure never pays a winner.**
 
 ### 4. ProofReader Fix — Pre-Consensus Substring Verification
 - **Problem**: Allowing unverified excerpt citations allows challengers to hallucinate quotes or challenge with fabricated context.
@@ -130,7 +130,7 @@ CoverLock incorporates specific architectural defenses derived from past smart c
 
 ### 5. Ironclad Fix — Bounded History, Matching Stakes & Strict Storage Caps
 - **Problem**: Unbounded input sizes and cheap griefing (1 wei counter-stake against large claims) allow DoS or risk-free jackpot fishing.
-- **CoverLock Solution**: Strict caps (`source <= 8000`, `brief <= 4000`, `fact <= 500`). `challenge_claim` enforces `counter_stake >= stake` and permits at most one active challenge per claim.
+- **CoverLock Solution**: Strict caps (`source <= 8000`, `brief <= 4000`, `fact <= 500`). `challenge_claim` enforces `counter_stake >= stake` and permits at most 8 challenges per claim.
 
 ---
 
@@ -193,9 +193,9 @@ python -m pytest tests/test_coverlock.py -v
 - `test_faithful_brief_bogus_omission_rejected`: **PASSED** (Bogus challenge forfeits stake)
 - `test_real_omission_confirmed`: **PASSED** (Omission confirmed, Challenger wins pool)
 - `test_real_contradiction_confirmed`: **PASSED** (Contradiction confirmed, Challenger wins pool)
-- `test_fabrication_confirmed`: **PASSED** (Fabrication confirmed, Challenger wins pool)
 - `test_unchallenged_expiry_refund`: **PASSED** (Expiry path refunds submitter)
-- `test_multi_challenge_immunization_fix`: **PASSED** (Rejected challenge doesn't break claim, second challenge wins)
+- `test_immunization_staff_case`: **PASSED** (Rejected challenge doesn't break claim, second challenge wins)
+- `test_double_payout_protection`: **PASSED** (First CONFIRMED wins pool, second gets C_REFUNDED)
 - `test_fairsplit_scar_payout_invariance`: **PASSED** (Payout invariant across kinds)
 - `test_concord_scar_single_source_of_truth`: **PASSED** (`coverage_paid` determines status)
 - `test_versionlock_scar_json_parsing_and_no_regex`: **PASSED** (Schema-aware json.loads, UNDETERMINED refund default)
@@ -213,7 +213,7 @@ from genlayer_py.client.genlayer_client import GenLayerClient
 from genlayer_py.chains.studionet import studionet
 
 client = GenLayerClient(studionet)
-contract_address = "0xb5282778F352F7d1daA5db35645F4Aab55C53386"
+contract_address = "0x54A39cf2d46196e09561db68B745eDE5a4cFc609"
 
 # Submitter stakes 1 GEN backing summary coverage
 tx = client.write_contract(
@@ -270,12 +270,7 @@ claim = client.read_contract(
 print("State Name:", claim["state_name"])       # "OPEN", "BROKEN", "EXPIRED"
 print("Coverage Paid:", claim["coverage_paid"]) # True or False
 
-challenge = client.read_contract(
-    address=contract_address,
-    function_name="get_challenge",
-    account=my_account,
-    args=["claim_0", 0],
-)
+challenge = claim["challenges"][0]
 
 print("Verdict:", challenge["verdict"])         # "CONFIRMED" or "REJECTED"
 ```
