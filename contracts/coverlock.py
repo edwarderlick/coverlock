@@ -24,20 +24,6 @@ MAX_EXCERPT_LEN: int = 280
 VALID_KINDS: set[str] = {"OMISSION", "CONTRADICTION", "FABRICATION"}
 
 
-def derive_settlement(verdict: str) -> str:
-    """
-    Pure function mapping consensus verdict to settlement outcome.
-    Zero tolerance, discrete closed enum, invariant across allegation kinds.
-    UNDETERMINED or unparseable outputs strictly refund both parties (never default to a winner).
-    """
-    if verdict == "CONFIRMED":
-        return "CHALLENGER_WINS"
-    elif verdict == "REJECTED":
-        return "SUBMITTER_WINS"
-    else:
-        return "REFUND"
-
-
 def validate_excerpts_and_caps(
     source: str,
     brief: str,
@@ -182,6 +168,7 @@ class ChallengeRecord:
     verdict: str
     reason: str
     resolved_at: u256
+    settlement: str
 
 
 @allow_storage
@@ -267,8 +254,8 @@ class CoverLock(gl.Contract):
             raise UserError(f"Claim '{claim_id}' not found")
 
         c = self.claims[claim_id]
-        if int(c.state) != STATE_OPEN:
-            raise UserError(f"Claim is not OPEN (current state: {STATE_NAMES[int(c.state)]})")
+        if c.coverage_paid or int(c.state) != STATE_OPEN:
+            raise UserError(f"Claim is not OPEN or coverage already paid (current state: {STATE_NAMES[int(c.state)]})")
 
         now_ts = self._get_current_timestamp()
         if now_ts > int(c.deadline):
@@ -313,6 +300,7 @@ class CoverLock(gl.Contract):
         ch.verdict = ""
         ch.reason = ""
         ch.resolved_at = u256(0)
+        ch.settlement = "PENDING"
 
         c.challenges[c.challenge_count] = ch
         c.challenge_count = u256(int(c.challenge_count) + 1)
@@ -432,15 +420,19 @@ class CoverLock(gl.Contract):
                 c.state = u256(STATE_BROKEN)
                 total_pool = u256(int(c.stake) + int(ch.counter_stake))
                 gl.get_contract_at(ch.challenger).emit_transfer(value=total_pool)
+                ch.settlement = "COVERAGE_PAID"
             else:
                 # Double-payout protection: refund their C, claim is already broken
                 gl.get_contract_at(ch.challenger).emit_transfer(value=ch.counter_stake)
+                ch.settlement = "C_REFUNDED"
         elif verdict == "REJECTED":
             # Forfeit C to claimant. Claim stays OPEN.
             gl.get_contract_at(c.claimant).emit_transfer(value=ch.counter_stake)
+            ch.settlement = "C_FORFEITED"
         else:
             # UNDETERMINED: refund C. Claim stays OPEN.
             gl.get_contract_at(ch.challenger).emit_transfer(value=ch.counter_stake)
+            ch.settlement = "C_REFUNDED"
 
     @gl.public.view
     def get_claim(self, claim_id: str) -> dict:
@@ -467,9 +459,6 @@ class CoverLock(gl.Contract):
         challenges_list = []
         for i in range(int(c.challenge_count)):
             ch = c.challenges[u256(i)]
-            ch_settlement = "PENDING"
-            if ch.verdict:
-                ch_settlement = derive_settlement(ch.verdict)
             
             challenges_list.append({
                 "challenge_id": i,
@@ -483,7 +472,7 @@ class CoverLock(gl.Contract):
                 "verdict": ch.verdict,
                 "reason": ch.reason,
                 "resolved_at": int(ch.resolved_at),
-                "settlement": ch_settlement
+                "settlement": ch.settlement
             })
 
         return {

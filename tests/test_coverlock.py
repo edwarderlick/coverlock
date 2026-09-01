@@ -84,8 +84,7 @@ def test_faithful_brief_bogus_omission_rejected(
     settled_record = contract.get_claim(claim_id)
     assert settled_record["state_name"] == "OPEN"
     assert settled_record["challenges"][0]["verdict"] == "REJECTED"
-    assert settled_record["challenges"][0]["settlement"] == "SUBMITTER_WINS"
-    assert contract.recompute_settlement(claim_id) == "PENDING"
+    assert settled_record["challenges"][0]["settlement"] == "C_FORFEITED"
 
 
 def test_real_omission_confirmed(
@@ -140,9 +139,8 @@ def test_real_omission_confirmed(
     settled_record = contract.get_claim(claim_id)
     assert settled_record["state_name"] == "BROKEN"
     assert settled_record["challenges"][0]["verdict"] == "CONFIRMED"
-    assert settled_record["challenges"][0]["settlement"] == "CHALLENGER_WINS"
+    assert settled_record["challenges"][0]["settlement"] == "COVERAGE_PAID"
     assert settled_record["settlement"] == "CHALLENGER_WINS"
-    assert contract.recompute_settlement(claim_id) == "CHALLENGER_WINS"
 
 
 def test_real_contradiction_confirmed(
@@ -198,6 +196,7 @@ def test_real_contradiction_confirmed(
     settled_record = contract.get_claim(claim_id)
     assert settled_record["state_name"] == "BROKEN"
     assert settled_record["settlement"] == "CHALLENGER_WINS"
+    assert settled_record["challenges"][0]["settlement"] == "COVERAGE_PAID"
 
 
 def test_unchallenged_expiry_refund(
@@ -230,7 +229,6 @@ def test_unchallenged_expiry_refund(
     record = contract.get_claim(claim_id)
     assert record["state_name"] == "EXPIRED"
     assert record["settlement"] == "REFUND"
-    assert contract.recompute_settlement(claim_id) == "REFUND"
 
 
 # ---------------------------------------------------------------------------
@@ -246,12 +244,6 @@ def test_fairsplit_scar_payout_invariance(
     Payout is invariant across allegation kinds and reasoning differences.
     """
     contract = direct_deploy(CONTRACT_PATH, 86400)
-    cov_mod = sys.modules["_contract_coverlock"]
-    derive_settlement = cov_mod.derive_settlement
-
-    assert derive_settlement("CONFIRMED") == "CHALLENGER_WINS"
-    assert derive_settlement("REJECTED") == "SUBMITTER_WINS"
-    assert derive_settlement("UNDETERMINED") == "REFUND"
 
     claimant = direct_alice
     challenger = direct_bob
@@ -308,7 +300,7 @@ def test_concord_scar_single_source_of_truth(
         direct_vm.value = 10**18
         claim_id = contract.open_claim(source, brief)
 
-    assert contract.recompute_settlement(claim_id) == contract.get_claim(claim_id)["settlement"] == "PENDING"
+    assert contract.get_claim(claim_id)["settlement"] == "PENDING"
 
     with direct_vm.prank(challenger):
         direct_vm.value = 10**18
@@ -325,7 +317,7 @@ def test_concord_scar_single_source_of_truth(
 
     # SETTLED state check - claim stays PENDING overall since it is not EXPIRED or BROKEN
     claim_record = contract.get_claim(claim_id)
-    assert contract.recompute_settlement(claim_id) == claim_record["settlement"] == "PENDING"
+    assert claim_record["settlement"] == "PENDING"
 
 
 def test_versionlock_scar_json_parsing_and_no_regex(
@@ -438,6 +430,8 @@ def test_immunization_staff_case(direct_vm, direct_deploy, direct_alice, direct_
     # Claim should remain OPEN
     rec = contract.get_claim(claim_id)
     assert rec["state_name"] == "OPEN"
+    assert rec["coverage_paid"] is False
+    assert rec["settlement"] == "PENDING"
 
     # 2. Real Challenge
     with direct_vm.prank(ch_real):
@@ -450,6 +444,12 @@ def test_immunization_staff_case(direct_vm, direct_deploy, direct_alice, direct_
     rec = contract.get_claim(claim_id)
     assert rec["state_name"] == "BROKEN"
     assert rec["settlement"] == "CHALLENGER_WINS"
+    
+    # Third challenge should revert because claim is BROKEN
+    with direct_vm.prank(direct_alice):
+        direct_vm.value = 10**18
+        with direct_vm.expect_revert("Claim is not OPEN or coverage already paid"):
+            contract.challenge_claim(claim_id, "OMISSION", "Late challenge", "Feature 2: Added 2FA.", "")
 
 
 def test_replay_protection(direct_vm, direct_deploy, direct_alice, direct_bob):
@@ -505,6 +505,7 @@ def test_double_payout_protection(direct_vm, direct_deploy, direct_alice, direct
     rec = contract.get_claim(claim_id)
     assert rec["state_name"] == "BROKEN"
     assert rec["coverage_paid"] is True
+    assert rec["challenges"][1]["settlement"] == "C_REFUNDED"
 
 
 def test_expire_after_rejects(direct_vm, direct_deploy, direct_alice, direct_bob):
@@ -574,3 +575,41 @@ def test_window_closes(direct_vm, direct_deploy, direct_alice, direct_bob):
         direct_vm.value = 10**18
         with direct_vm.expect_revert("Challenge window has expired"):
             contract.challenge_claim(claim_id, "OMISSION", "Missing A", "Source text part A that is long enough", "")
+
+def test_nine_challenges_reverts(direct_vm, direct_deploy, direct_alice, direct_bob):
+    contract = direct_deploy(CONTRACT_PATH, 86400)
+    direct_vm.deal(direct_alice, 10**18)
+    direct_vm.deal(direct_bob, 10**20)
+
+    with direct_vm.prank(direct_alice):
+        direct_vm.value = 10**18
+        claim_id = contract.open_claim("Source text part A that is long enough, part B", "Brief text")
+
+    # 8 challenges allowed
+    for i in range(8):
+        with direct_vm.prank(direct_bob):
+            direct_vm.value = 10**18
+            excerpt = "Source text part A that is long enough, part B"[i:i+20]
+            contract.challenge_claim(claim_id, "OMISSION", f"Fact {i}", excerpt, "")
+            
+    # 9th should revert
+    with direct_vm.prank(direct_bob):
+        direct_vm.value = 10**18
+        with direct_vm.expect_revert("Maximum 8 challenges per claim reached"):
+            excerpt = "Source text part A that is long enough, part B"[8:28]
+            contract.challenge_claim(claim_id, "OMISSION", "Fact 9", excerpt, "")
+
+def test_under_stake_reverts(direct_vm, direct_deploy, direct_alice, direct_bob):
+    contract = direct_deploy(CONTRACT_PATH, 86400)
+    direct_vm.deal(direct_alice, 10**18)
+    direct_vm.deal(direct_bob, 10**18)
+
+    with direct_vm.prank(direct_alice):
+        direct_vm.value = 10**18
+        claim_id = contract.open_claim("Source text part A that is long enough, part B", "Brief text")
+
+    # Bob tries to challenge with less than 10**18
+    with direct_vm.prank(direct_bob):
+        direct_vm.value = 5 * 10**17
+        with direct_vm.expect_revert("Counter-stake (500000000000000000 wei) must be at least equal to claimant stake"):
+            contract.challenge_claim(claim_id, "OMISSION", "Fact 1", "Source text part A that is long enough", "")

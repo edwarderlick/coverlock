@@ -23,14 +23,14 @@ def main():
     print("Deploying main contract...")
     tx1 = client.deploy_contract(local_source, args=[86400])
     client.wait_for_transaction_receipt(tx1)
-    addr1 = client.get_transaction_receipt(tx1).get("contractAddress")
-    print(f"Main Contract deployed at: {addr1}")
+    rc1 = client.get_transaction_receipt(tx1)
+    print(f"Main Contract receipt: {rc1}")
     
     print("Deploying expiry contract...")
     tx2 = client.deploy_contract(local_source, args=[5])
     client.wait_for_transaction_receipt(tx2)
-    addr2 = client.get_transaction_receipt(tx2).get("contractAddress")
-    print(f"Expiry Contract deployed at: {addr2}")
+    rc2 = client.get_transaction_receipt(tx2)
+    print(f"Expiry Contract receipt: {rc2}")
 
 if __name__ == "__main__":
     main()

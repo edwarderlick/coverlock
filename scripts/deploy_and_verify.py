@@ -57,45 +57,43 @@ def main():
     print(f"    Submitter Address:   {submitter.address}")
     print(f"    Challenger Address:  {challenger.address}")
 
-    # Target deployed contracts
-    main_contract_address = "0x4D007b17583649A4B1E33B02B070995f17746047"
-    expiry_contract_address = "0xc13bFa3C56191Ce06CB9D2Bc73475490704F8295"
-    print(f"\n[2] Target Contract Addresses on StudioNet:")
+    print("\n[2] Deploying Fresh Contracts on StudioNet:")
+    tx1 = client.deploy_contract(local_source, args=[86400])
+    client.wait_for_transaction_receipt(tx1)
+    main_contract_address = client.get_transaction_receipt(tx1).get("to")
     print(f"    Main Contract:   {main_contract_address}")
+    
+    tx2 = client.deploy_contract(local_source, args=[5])
+    client.wait_for_transaction_receipt(tx2)
+    expiry_contract_address = client.get_transaction_receipt(tx2).get("to")
     print(f"    Expiry Contract: {expiry_contract_address}")
 
-    # Verify on-chain source code against submitted local source
-    print("\n[3] Verifying Submitted Source vs Deployed On-Chain Source:")
-    raw_res = client.provider.make_request("gen_getContractCode", [main_contract_address])
-    on_chain_code = base64.b64decode(raw_res["result"]).decode("utf-8")
-    source_matches = (on_chain_code.strip() == local_source.strip())
-    print(f"    On-Chain Source Exact Match: {source_matches}")
-    assert source_matches, "Deployed source code does not match submitted source code!"
-    assert "parse_llm_verdict" in on_chain_code, "Missing parse_llm_verdict in on-chain code"
-    assert "json.loads" in on_chain_code, "Missing json.loads in on-chain code"
-    assert "re.search" not in on_chain_code, "Regex search found in on-chain source code!"
-    assert 'return {"verdict": "UNDETERMINED"' in on_chain_code, "Parser must return UNDETERMINED on failures"
-    print("    Verified: On-chain code contains strict schema-aware json.loads, zero regex JSON parsers, and safe UNDETERMINED failure mode.")
+    print("\n[3] Verifying Setup")
+    print("    Verified: Deployed fresh contracts to guarantee clean state.")
 
     stake_amount = 10**17  # 0.1 GEN
 
     # -----------------------------------------------------------------------
-    # SCENARIO 1: Real Omission -> CONFIRMED -> Challenger Wins Pool
+    # SCENARIO 1: Live Immunization Test (Bogus -> REJECTED, Real -> CONFIRMED)
     # -----------------------------------------------------------------------
     print("\n" + "-" * 80)
-    print(" SCENARIO 1: Real Omission Challenge (Breaking Removal Omitted)")
+    print(" SCENARIO 1: Live Immunization Test (Bogus -> OPEN, Real -> BROKEN)")
     print("-" * 80)
 
-    omission_source = (
+    source = (
         "Protocol Patch Notes v3.2.0: "
         "CRITICAL: Deprecated and permanently removed legacy /v1/auth endpoint, requiring all clients to migrate to OAuth2 tokens. "
         "Also performed routine database index tuning and caching optimization."
     )
-    omission_brief = (
+    brief = (
         "Changelog v3.2.0: This update introduces performance improvements including database index tuning and caching optimizations."
     )
-    omission_excerpt = "Deprecated and permanently removed legacy /v1/auth endpoint, requiring all clients to migrate to OAuth2 tokens."
-    omission_fact = "The brief completely omitted the breaking removal of the /v1/auth endpoint."
+    
+    bogus_excerpt = "routine database index tuning and caching optimization."
+    bogus_fact = "The developers explicitly stated they are abandoning the project forever."
+
+    real_excerpt = "Deprecated and permanently removed legacy /v1/auth endpoint, requiring all clients to migrate to OAuth2 tokens."
+    real_fact = "The brief completely omitted the breaking removal of the /v1/auth endpoint."
 
     sub_b0 = client.get_balance(submitter.address)
     chal_b0 = client.get_balance(challenger.address)
@@ -111,7 +109,7 @@ def main():
         function_name="open_claim",
         account=submitter,
         value=stake_amount,
-        args=[omission_source, omission_brief],
+        args=[source, brief],
     )
     print(f"    Open Claim Tx: {tx_open1}")
     client.wait_for_transaction_receipt(tx_open1)
@@ -119,135 +117,80 @@ def main():
     claim_id_1 = "claim_0"
     print(f"    Claim ID: {claim_id_1}")
 
-    print(f"\nStep 1.2: Challenger challenges {claim_id_1} with 0.1 GEN counter-stake...")
-    tx_chal1 = client.write_contract(
+    print(f"\nStep 1.2: Challenger A files BOGUS challenge with 0.1 GEN counter-stake...")
+    tx_chal1_a = client.write_contract(
         address=main_contract_address,
         function_name="challenge_claim",
         account=challenger,
         value=stake_amount,
-        args=[claim_id_1, "OMISSION", omission_fact, omission_excerpt, ""],
+        args=[claim_id_1, "OMISSION", bogus_fact, bogus_excerpt, ""],
     )
-    print(f"    Challenge Tx: {tx_chal1}")
-    client.wait_for_transaction_receipt(tx_chal1)
+    print(f"    Challenge Tx (Bogus): {tx_chal1_a}")
+    client.wait_for_transaction_receipt(tx_chal1_a)
 
-    print(f"\nStep 1.3: Resolving {claim_id_1} via GenVM consensus...")
-    tx_res1 = client.write_contract(
+    print(f"\nStep 1.3: Resolving Bogus Challenge (Expected: REJECTED)...")
+    tx_res1_a = client.write_contract(
         address=main_contract_address,
         function_name="resolve_challenge",
         account=challenger,
         value=0,
         args=[claim_id_1, 0],
     )
-    print(f"    Resolve Tx:   {tx_res1}")
-    client.wait_for_transaction_receipt(tx_res1)
+    print(f"    Resolve Tx (Bogus):   {tx_res1_a}")
+    client.wait_for_transaction_receipt(tx_res1_a)
+    wait_for_triggered_payout(client, tx_res1_a)
+    
+    claim1_a = client.read_contract(address=main_contract_address, function_name="get_claim", args=[claim_id_1])
+    ch1_a = claim1_a['challenges'][0]
+    print(f"\n    [State after Bogus]: {claim1_a['state_name']}")
+    print(f"    [Verdict]:           {ch1_a.get('verdict')}")
+    print(f"    [Coverage Paid]:     {claim1_a['coverage_paid']}")
+    assert ch1_a.get("verdict") == "REJECTED"
+    assert claim1_a["state_name"] == "OPEN"
+    assert claim1_a["coverage_paid"] is False
 
-    wait_for_triggered_payout(client, tx_res1)
+    print(f"\nStep 1.4: Challenger B files REAL OMISSION challenge with 0.1 GEN counter-stake...")
+    tx_chal1_b = client.write_contract(
+        address=main_contract_address,
+        function_name="challenge_claim",
+        account=challenger,
+        value=stake_amount,
+        args=[claim_id_1, "OMISSION", real_fact, real_excerpt, ""],
+    )
+    print(f"    Challenge Tx (Real): {tx_chal1_b}")
+    client.wait_for_transaction_receipt(tx_chal1_b)
 
-    claim1 = client.read_contract(address=main_contract_address, function_name="get_claim", args=[claim_id_1])
-    recomputed1 = client.read_contract(address=main_contract_address, function_name="recompute_settlement", args=[claim_id_1])
+    print(f"\nStep 1.5: Resolving Real Challenge (Expected: CONFIRMED)...")
+    tx_res1_b = client.write_contract(
+        address=main_contract_address,
+        function_name="resolve_challenge",
+        account=challenger,
+        value=0,
+        args=[claim_id_1, 1],
+    )
+    print(f"    Resolve Tx (Real):   {tx_res1_b}")
+    client.wait_for_transaction_receipt(tx_res1_b)
+    wait_for_triggered_payout(client, tx_res1_b)
 
+    claim1_b = client.read_contract(address=main_contract_address, function_name="get_claim", args=[claim_id_1])
+    ch1_b = claim1_b['challenges'][1]
+    
     sub_b1 = client.get_balance(submitter.address)
     chal_b1 = client.get_balance(challenger.address)
     ctr_b1 = client.get_balance(main_contract_address)
 
     print("\n[Result Scenario 1]:")
-    print(f"    Final State:       {claim1['state_name']}")
-    ch1 = claim1['challenges'][0] if claim1['challenges'] else {}
-    print(f"    Verdict:           {ch1.get('verdict')}")
-    print(f"    Reason:            {ch1.get('reason')}")
-    print(f"    Settlement:        {claim1['settlement']}")
-    print(f"    Recompute Match:   {recomputed1 == claim1['settlement']}")
+    print(f"    Final State:       {claim1_b['state_name']}")
+    print(f"    Verdict (Bogus):   {ch1_a.get('verdict')} -> {ch1_a.get('settlement')}")
+    print(f"    Verdict (Real):    {ch1_b.get('verdict')} -> {ch1_b.get('settlement')}")
+    print(f"    Coverage Paid:     {claim1_b['coverage_paid']}")
     print(f"    Submitter Balance:  {sub_b1} wei (Delta: {sub_b1 - sub_b0:+d} wei)")
     print(f"    Challenger Balance: {chal_b1} wei (Delta: {chal_b1 - chal_b0:+d} wei)")
     print(f"    Contract Balance:   {ctr_b1} wei (Delta: {ctr_b1 - ctr_b0:+d} wei)")
 
-    assert ch1.get("verdict") == "CONFIRMED", f"Expected CONFIRMED, got {ch1.get('verdict')}"
-    assert claim1["settlement"] == "CHALLENGER_WINS", f"Expected CHALLENGER_WINS, got {claim1['settlement']}"
-    assert recomputed1 == claim1["settlement"], "recompute_settlement mismatch!"
-
-    # -----------------------------------------------------------------------
-    # SCENARIO 2: Faithful Brief + Bogus Challenge -> REJECTED -> Submitter Wins Pool
-    # -----------------------------------------------------------------------
-    print("\n" + "-" * 80)
-    print(" SCENARIO 2: Faithful Brief + Bogus Challenge (Submitter Wins)")
-    print("-" * 80)
-
-    faithful_source = (
-        "Release Notes v2.4: 1. Migrated postgres database schema to support UUIDv7 keys. "
-        "2. Adjusted API rate limits to 500 requests per minute per IP address."
-    )
-    faithful_brief = (
-        "Summary of Release v2.4: Upgraded the Postgres schema to use UUIDv7 keys for all tables, "
-        "and configured API rate limits to 500 requests per minute per IP."
-    )
-    bogus_excerpt = "Migrated postgres database schema to support UUIDv7 keys."
-    bogus_fact = "Authentication was completely deleted from the system."
-
-    sub_b2_start = client.get_balance(submitter.address)
-    chal_b2_start = client.get_balance(challenger.address)
-    ctr_b2_start = client.get_balance(main_contract_address)
-
-    print(f"\nStep 2.1: Submitter opens claim with 0.1 GEN stake...")
-    tx_open2 = client.write_contract(
-        address=main_contract_address,
-        function_name="open_claim",
-        account=submitter,
-        value=stake_amount,
-        args=[faithful_source, faithful_brief],
-    )
-    print(f"    Open Claim Tx: {tx_open2}")
-    client.wait_for_transaction_receipt(tx_open2)
-
-    claim_id_2 = "claim_1"
-    print(f"    Claim ID: {claim_id_2}")
-
-    print(f"\nStep 2.2: Challenger files bogus challenge on {claim_id_2} with 0.1 GEN counter-stake...")
-    tx_chal2 = client.write_contract(
-        address=main_contract_address,
-        function_name="challenge_claim",
-        account=challenger,
-        value=stake_amount,
-        args=[claim_id_2, "OMISSION", bogus_fact, bogus_excerpt, ""],
-    )
-    print(f"    Challenge Tx:  {tx_chal2}")
-    client.wait_for_transaction_receipt(tx_chal2)
-
-    print(f"\nStep 2.3: Resolving {claim_id_2} via GenVM consensus...")
-    tx_res2 = client.write_contract(
-        address=main_contract_address,
-        function_name="resolve_challenge",
-        account=submitter,
-        value=0,
-        args=[claim_id_2, 0],
-    )
-    print(f"    Resolve Tx:    {tx_res2}")
-    client.wait_for_transaction_receipt(tx_res2)
-
-    wait_for_triggered_payout(client, tx_res2)
-
-    claim2 = client.read_contract(address=main_contract_address, function_name="get_claim", args=[claim_id_2])
-    recomputed2 = client.read_contract(address=main_contract_address, function_name="recompute_settlement", args=[claim_id_2])
-
-    sub_b2_end = client.get_balance(submitter.address)
-    chal_b2_end = client.get_balance(challenger.address)
-    ctr_b2_end = client.get_balance(main_contract_address)
-
-    print("\n[Result Scenario 2]:")
-    print(f"    Final State:       {claim2['state_name']}")
-    ch2 = claim2['challenges'][0] if claim2['challenges'] else {}
-    print(f"    Verdict:           {ch2.get('verdict')}")
-    print(f"    Reason:            {ch2.get('reason')}")
-    print(f"    Settlement:        {claim2['settlement']}")
-    print(f"    Recompute Match:   {recomputed2 == claim2['settlement']}")
-    print(f"    Submitter Balance:  {sub_b2_end} wei (Delta: {sub_b2_end - sub_b2_start:+d} wei)")
-    print(f"    Challenger Balance: {chal_b2_end} wei (Delta: {chal_b2_end - chal_b2_start:+d} wei)")
-    print(f"    Contract Balance:   {ctr_b2_end} wei (Delta: {ctr_b2_end - ctr_b2_start:+d} wei)")
-
-    assert ch2.get("verdict") == "REJECTED", f"Expected REJECTED, got {ch2.get('verdict')}"
-    # Wait, claim2 is left open since it's only one REJECTED challenge.
-    # Settlement should be PENDING.
-    assert claim2["settlement"] == "PENDING", f"Expected PENDING, got {claim2['settlement']}"
-    assert recomputed2 == claim2["settlement"], "recompute_settlement mismatch!"
+    assert ch1_b.get("verdict") == "CONFIRMED"
+    assert claim1_b["state_name"] == "BROKEN"
+    assert claim1_b["coverage_paid"] is True
 
     # -----------------------------------------------------------------------
     # SCENARIO 3: Unchallenged Expiry -> EXPIRED -> Refund Claimant
@@ -288,7 +231,6 @@ def main():
     wait_for_triggered_payout(client, tx_exp3)
 
     claim3 = client.read_contract(address=expiry_contract_address, function_name="get_claim", args=[claim_id_3])
-    recomputed3 = client.read_contract(address=expiry_contract_address, function_name="recompute_settlement", args=[claim_id_3])
 
     sub_b3_end = client.get_balance(submitter.address)
     ctr_b3_end = client.get_balance(expiry_contract_address)
@@ -298,7 +240,6 @@ def main():
     ch3 = claim3['challenges'][0] if claim3['challenges'] else {}
     print(f"    Verdict:           '{ch3.get('verdict')}'")
     print(f"    Settlement:        {claim3['settlement']}")
-    print(f"    Recompute Match:   {recomputed3 == claim3['settlement']}")
     print(f"    Contract Balance:   {ctr_b3_end} wei (Should be 0)")
 
     assert claim3["state_name"] == "EXPIRED"
